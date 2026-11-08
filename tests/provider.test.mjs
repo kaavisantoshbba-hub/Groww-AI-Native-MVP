@@ -1,11 +1,12 @@
 import test from 'node:test';import assert from 'node:assert/strict';import {readFileSync} from 'node:fs';
-import {answer,generateAnswer,readiness,modelName,REQUEST_BUDGET_MS,skipTimingQuestion} from '../lib/provider.mjs';
+import {answer,generateAnswer,readiness,modelName,REQUEST_BUDGET_MS,skipTimingQuestion,unsafeDraft,validClaimEvidence} from '../lib/provider.mjs';
 import {maxDuration,POST} from '../app/api/helper/route.js';
 const ok={relevant:true,grounded:true,noAdvice:true,noUnverifiedAccountClaims:true,missingInfoHandled:true};
 const sel={action:'answer',question:'',ruleIds:['mandate'],verdict:'not_checked'};
 const draft={text:'AutoPay permits automatic SIP debits from your linked bank account.',ruleIds:['mandate']};
+const withEvidence=(value,opts)=>{if(!value||!('grounded' in value)||'claims' in value)return value;const b=JSON.parse(opts.body);const d=JSON.parse(b.messages?.[1]?.content||b.contents[0].parts[0].text);return {...value,claims:(d.proposedAnswer.match(/[^.!?]+[.!?]*/g)||[]).map(sentence=>({sentence:sentence.trim(),ruleId:d.expectedSample?'sample':d.evidence[0].id,quote:d.expectedSample?.text||d.evidence[0].text}))};};
 const response=o=>({ok:true,json:async()=>({choices:[{finish_reason:'stop',message:{content:JSON.stringify(o)}}]})});
-const mock=(...values)=>{const calls=[];const f=async(url,opts)=>{calls.push({url,opts});const value=values.shift();if(value instanceof Error)throw value;return value?.ok===false?value:response(value);};return {fetchImpl:f,calls};};
+const mock=(...values)=>{const calls=[];const f=async(url,opts)=>{calls.push({url,opts});const value=values.shift();if(value instanceof Error)throw value;return value?.ok===false?value:response(withEvidence(value,opts));};return {fetchImpl:f,calls};};
 async function keyed(fn){
  const keys=['GROQ_API_KEY','GROQ_MODEL','GEMINI_API_KEY','GEMINI_MODEL'];
  const old=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
@@ -46,7 +47,7 @@ test('Groq request uses bearer auth and strict standard JSON Schema for all stag
   assert.equal(schema.schema.type,'object');assert.equal(schema.schema.additionalProperties,false);
   assert.deepEqual(schema.schema.required,Object.keys(schema.schema.properties));
   assert(!JSON.stringify(body).includes('LEGACY_SECRET'));
-  for(const v of Object.values(schema.schema.properties)){assert.equal(v.type,v.type.toLowerCase());if(v.items)assert.equal(v.items.type,'string');}
+  for(const v of Object.values(schema.schema.properties)){assert.equal(v.type,v.type.toLowerCase());if(v.items)assert(['string','object'].includes(v.items.type));}
  }
 }));
 test('one delayed retry recovers Groq 429 and 503 while retaining the same signal',()=>keyed(async()=>{
@@ -87,7 +88,7 @@ test('Gemini-only configuration preserves the legacy request and response format
  process.env.GEMINI_MODEL='custom-flash';assert.equal(modelName(),'custom-flash');
  const values=[sel,draft,ok],calls=[];
  const r=await answer('What is AutoPay?',{},[],{fetchImpl:async(url,opts)=>{
-  calls.push({url,opts});return {ok:true,json:async()=>({candidates:[{finishReason:'STOP',content:{parts:[{text:JSON.stringify(values.shift())}]}}]})};
+  calls.push({url,opts});return {ok:true,json:async()=>({candidates:[{finishReason:'STOP',content:{parts:[{text:JSON.stringify(withEvidence(values.shift(),opts))}]}}]})};
  }});
  assert.equal(r.mode,'ai');assert.equal(calls.length,3);
  assert(calls.every(c=>c.url.endsWith('/custom-flash:generateContent')));
@@ -98,4 +99,53 @@ test('Gemini-only configuration preserves the legacy request and response format
 }));
 
 test('skip-deadline questions get the fixed timing rule with sources and make NO AI call',()=>keyed(async()=>{for(const q of ['can i skip tomorrows payment','Can I skip tomorrow’s payment?','can I skip my SIP today','what is the last date to skip my sip','kal ka SIP skip kar sakta hoon?']){const m=mock(sel,draft,ok);const r=await answer(q,{},[],m);assert.equal(m.calls.length,0,q);assert.equal(r.mode,'rule',q);assert.deepEqual(r.ruleIds,['timing']);assert(r.sources.some(s=>s.id==='S1')&&r.sources.some(s=>s.id==='S3'));assert.match(r.message,/2 working days/);assert.match(r.message,/cannot confirm/);assert(!/\byes\b/i.test(r.message));}}));
-test('non-deadline skip questions still use the AI path',()=>keyed(async()=>{for(const q of ['What happens if I skip three SIP instalments in a row?','What does skip mean?','How long can I skip my SIP?']){assert.equal(skipTimingQuestion(q),false,q);}const m=mock({...sel,ruleIds:['skip']},{text:'Groww allows one instalment to be skipped at a time.',ruleIds:['skip']},ok);const r=await answer('Can I skip my SIP for a month?',{},[],m);assert.equal(m.calls.length,3);assert.equal(r.mode,'ai');}));
+test('non-deadline skip questions still use the AI path',()=>keyed(async()=>{for(const q of ['What happens if I skip three SIP instalments in a row?','What does skip mean?','How long can I skip my SIP?']){assert.equal(skipTimingQuestion(q),false,q);}const m=mock({...sel,ruleIds:['skip']},{text:'Groww allows one instalment to be skipped at a time. Three consecutive skipped instalments cancel the SIP.',ruleIds:['skip','third-skip']},ok);const r=await answer('Can I skip my SIP for a month?',{},[],m);assert.equal(m.calls.length,3);assert.equal(r.mode,'ai');}));
+
+// Reported live failures: regression cases, not an AI accuracy score.
+// WRONG: date change 3 days before was answered Yes with an invented cut-off.
+for(const q of ['Can I cancel my SIP tomorrow?','Can I cancel my SIP 5 days before the instalment date?','When can I cancel my SIP?','How can I cancel my SIP tomorrow?'])test(`fixed cancellation: ${q}`,()=>keyed(async()=>{
+ const m=mock();const r=await answer(q,{},[],m);assert.equal(m.calls.length,0);assert.equal(r.mode,'rule');assert.match(r.message,/7-day/);assert.match(r.message,/3 working days/);assert.match(r.message,/conflict/);assert.deepEqual(r.sources.map(s=>s.id),['S11','S12']);assert(!/\byes\b|may be allowed|initiate.*today/i.test(r.message));
+}));
+for(const q of ['Can I change my SIP date 3 days before the instalment?','edit my amount 2 days before','How do I edit my SIP tomorrow?'])test(`fixed edit timing: ${q}`,()=>keyed(async()=>{
+ const m=mock();const r=await answer(q,{},[],m);assert.equal(m.calls.length,0);assert.equal(r.mode,'rule');assert.match(r.message,/within 2 working days/);assert.match(r.message,/weekends and holidays/);assert.match(r.message,/effective instalment\/date/);assert.deepEqual(r.sources.map(s=>s.id),['S1']);assert(!/^yes/i.test(r.message));
+}));
+for(const [q,source,steps] of [
+ ['SIP skip kaise karte hain?','S4',/My SIPs → select the SIP → choose Skip/],
+ ['How do I skip my SIP?','S4',/three consecutive skipped/i],
+ ['How do I cancel my SIP?','S11',/Cancel SIP at the top right → select a reason/],
+ ['How do I edit my amount?','S2',/Edit Amount & Date → enter your changes → review → Save Changes/]
+])test(`fixed steps: ${q}`,()=>keyed(async()=>{const m=mock();const r=await answer(q,{},[],m);assert.equal(m.calls.length,0);assert.equal(r.mode,'rule');assert(r.sources.some(s=>s.id===source));assert.match(r.message,steps);}));
+const faults=[
+ ['Can I cancel my SIP tomorrow?','Yes, you can cancel before tomorrow’s instalment; initiate it today to avoid tomorrow’s charge.',['cancel']],
+ ['Can I cancel 5 days before?','The window is 3 working days to 7 days, so 5 days may be allowed.',['cancel']],
+ ['Cancel and withdraw everything','After redemption the SIP will be inactive; redemption takes 2-3 working days.',['cancel']],
+ ['Payment failed, no money deducted, balance low',"If Pay Now isn’t shown, contact support.",['failed']],
+ ['Money deducted but order not showing. Pay again?','Wait 5-6 business days or contact support after 2 working days.',['missing','deducted']],
+ ['If I skip a month will my SIP still count as active?','Your SIP stays active.',['skip']],
+ ['SIP skip kaise karte hain?','Go to Edit SIP. Your SIP remains active.',['skip']],
+ ['Can I change my SIP date 3 days before?','Yes, you are before the cut-off.',['edit']],
+ ['How to disable AutoPay?','You can disable it or switch to manual.',['mandate']],
+ ['Units not allocated','Contact support after 2 working days.',['deducted']],
+ ['Can I skip a month?','You can skip one instalment.',['skip']]
+];
+for(const [q,text,ids] of faults)test(`local rejection: ${q}`,()=>{assert.equal(unsafeDraft(text,q,ids,null),true);});
+for(const [q,text,ids] of faults.filter(([q])=>! /tomorrow|before|kaise/i.test(q)))test(`bad answer withheld despite a passing model check: ${q}`,()=>keyed(async()=>{
+ const m=mock({...sel,ruleIds:ids},{text,ruleIds:ids},ok);const r=await answer(q,{},[],m);assert.equal(r.diagnostic,'check:answer_rejected');assert.equal(r.mode,'fallback');assert.notEqual(r.message,text);
+}));
+test('checker requires exact evidence and coverage of every sentence',()=>{
+ const evidence=[{id:'terms',text:'A SIP is a way to invest regularly.'}];
+ const text='A SIP is a way to invest regularly.';
+ const good={claims:[{sentence:text,ruleId:'terms',quote:evidence[0].text}]};
+ assert(validClaimEvidence(good,text,evidence,null,false));
+ for(const bad of [{claims:[]},{claims:[{...good.claims[0],quote:'Invented source line'}]},{claims:[{...good.claims[0],ruleId:'cancel'}]}])assert(!validClaimEvidence(bad,text,evidence,null,false));
+ assert(!validClaimEvidence(good,text+' Guaranteed return.',evidence,null,false));
+});
+test('missing evidence report is a safe fallback, even with all booleans true',()=>keyed(async()=>{
+ const r=await answer('What is AutoPay?',{},[],mock(sel,draft,{...ok,claims:[]}));assert.equal(r.diagnostic,'check:answer_rejected');
+}));
+test('uncited rule cannot supply checker evidence',()=>keyed(async()=>{
+ const r=await answer('What is AutoPay?',{},[],mock(sel,draft,{...ok,claims:[{sentence:draft.text,ruleId:'terms',quote:'A SIP is a way to invest a set amount'}]}));assert.equal(r.diagnostic,'check:answer_rejected');
+}));
+test('fixed rule label and disclaimer remain visible',()=>{const ui=readFileSync('app/page.jsx','utf8');assert(ui.includes('CHECKED RULE · NO AI'));assert(ui.includes('Educational prototype. Not investment advice. Sample data only.'));});
+
+test('allocation support after its own period is not treated as missing-order advice',()=>{assert.equal(unsafeDraft('If it still does not show after 5–6 business days, contact Groww support.','Units still being allocated',['deducted'],null),false);});
