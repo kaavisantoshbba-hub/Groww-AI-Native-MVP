@@ -1,0 +1,11 @@
+import {build} from 'esbuild';
+import {readFileSync,writeFileSync,mkdirSync} from 'node:fs';
+const result=await build({entryPoints:['scripts/offline-entry.jsx'],bundle:true,minify:true,write:false,format:'iife',jsx:'automatic',define:{'process.env.NODE_ENV':'"production"'}});
+let code=result.outputFiles[0].text;
+code=code.replaceAll('/Groww_SIP_Rules_and_Sources.docx','data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,'+readFileSync('public/Groww_SIP_Rules_and_Sources.docx').toString('base64'));
+code=code.replaceAll('/evaluation.json','data:application/json;base64,'+readFileSync('public/evaluation.json').toString('base64'));
+const css=readFileSync('app/globals.css','utf8').replace(/@import\s+url\([\s\S]*?\);/g,'');
+mkdirSync('exports',{recursive:true});
+writeFileSync('exports/Groww_SIP_Practice_Preview.html',`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Groww SIP practice · Independent prototype</title><style>${css}</style></head><body><div id="root"></div><script>${code.replaceAll('</script','<\\/script')}</script></body></html>`);
+writeFileSync('public/Groww_SIP_Practice_Preview.html',readFileSync('exports/Groww_SIP_Practice_Preview.html'));
+console.log('exports/Groww_SIP_Practice_Preview.html');
