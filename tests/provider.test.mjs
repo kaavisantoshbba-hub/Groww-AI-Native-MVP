@@ -1,5 +1,5 @@
 import test from 'node:test';import assert from 'node:assert/strict';import {readFileSync} from 'node:fs';
-import {answer,generateAnswer,readiness,modelName,REQUEST_BUDGET_MS,skipTimingQuestion,unsafeDraft,validClaimEvidence,checkedDefinition,claimEvidenceFailure} from '../lib/provider.mjs';
+import {answer,generateAnswer,readiness,modelName,REQUEST_BUDGET_MS,skipTimingQuestion,unsafeDraft,validClaimEvidence,checkedDefinition,claimEvidenceFailure,aiEvidenceCatalog,failure} from '../lib/provider.mjs';
 import {maxDuration,POST} from '../app/api/helper/route.js';
 const ok={relevant:true,grounded:true,noAdvice:true,noUnverifiedAccountClaims:true,missingInfoHandled:true};
 const sel={action:'answer',question:'',ruleIds:['mandate'],verdict:'not_checked'};
@@ -211,3 +211,43 @@ test('new diagnostics distinguish local, reviewer and evidence checks and contai
  for(const r of [a,b,c])assert(!/TEST_ONLY_SECRET|PRIVATE_QUESTION|PRIVATE_PROVIDER_TEXT/.test(JSON.stringify(r)));
 }));
 test('UI labels checked definitions honestly',()=>assert(readFileSync('app/page.jsx','utf8').includes('CHECKED DEFINITION · NO AI')));
+
+// Live-site regression: both cancellation-versus-redemption phrasings were
+// rejected by check:reviewer:grounded. These tests verify source plumbing,
+// not live model accuracy or the contents of the withheld live draft.
+test('AI retrieval includes the existing reviewed glossary without changing safety rule IDs',()=>{
+ const catalog=aiEvidenceCatalog();
+ const cancel=catalog.find(r=>r.id==='cancel');
+ assert.match(cancel.text,/Redeem: Sell existing mutual fund units to withdraw their value/);
+ assert(cancel.sources.includes('S13'));assert(cancel.sources.includes('S11'));
+ assert.match(cancel.text,/7 days/);assert.match(cancel.text,/3 working days/);
+ assert.match(catalog.find(r=>r.id==='mandate').text,/Payments can still fail/);
+ assert.match(catalog.find(r=>r.id==='terms').text,/Allotment is when those units are assigned/);
+});
+test('comparison stays live AI with three calls and the same source text in all stages',()=>keyed(async()=>{
+ const text='Cancelling a SIP stops future scheduled instalments. Redeeming means selling existing mutual fund units to withdraw their value.';
+ const m=mock({...sel,ruleIds:['cancel']},{text,ruleIds:['cancel']},{...ok,claims:[
+  {sentence:'Cancelling a SIP stops future scheduled instalments.',ruleId:'cancel',quote:'Cancelling a SIP stops future scheduled instalments'},
+  {sentence:'Redeeming means selling existing mutual fund units to withdraw their value.',ruleId:'cancel',quote:'Sell existing mutual fund units to withdraw their value'}
+ ]});
+ const result=await answer('How is cancelling different from redeeming?',{},[],m);
+ assert.equal(result.mode,'ai');assert.equal(m.calls.length,3);
+ assert(result.sources.some(s=>s.id==='S13'));
+ const inputs=m.calls.map(c=>JSON.parse(JSON.parse(c.opts.body).messages[1].content));
+ const source=inputs[0].catalog.find(r=>r.id==='cancel').text;
+ assert.equal(inputs[1].evidence[0].text,source);assert.equal(inputs[2].evidence[0].text,source);
+ assert(m.calls.every(c=>c.opts.signal===m.calls[0].opts.signal));
+}));
+test('glossary support cannot override a rejected comparison or invented redemption timing',()=>keyed(async()=>{
+ const text='Redemption takes 2-3 working days.';
+ const m=mock({...sel,ruleIds:['cancel']},{text,ruleIds:['cancel']},ok);
+ assert.equal((await answer('Explain redemption compared with cancellation',{},[],m)).diagnostic,'check:unsafeDraft');
+ const rejected=mock({...sel,ruleIds:['cancel']},{text:'Redeeming means selling existing units.',ruleIds:['cancel']},{...ok,grounded:false});
+ assert.equal((await answer('Explain redemption compared with cancellation',{},[],rejected)).diagnostic,'check:reviewer:grounded');
+}));
+
+test('fallback copy distinguishes source rejection from provider quota',()=>{
+ assert.match(failure('check:reviewer:grounded').message,/answer-check failure, not a usage-limit/);
+ assert.match(failure('selection:groq_http_429_RESOURCE_EXHAUSTED').message,/Waiting one minute may not resolve/);
+ assert(!failure('selection:network_error').message.includes('source or safety check'));
+});
