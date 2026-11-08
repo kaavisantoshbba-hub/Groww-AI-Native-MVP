@@ -1,5 +1,5 @@
 import test from 'node:test';import assert from 'node:assert/strict';import {readFileSync} from 'node:fs';
-import {answer,generateAnswer,readiness,modelName,REQUEST_BUDGET_MS} from '../lib/provider.mjs';
+import {answer,generateAnswer,readiness,modelName,REQUEST_BUDGET_MS,skipTimingQuestion} from '../lib/provider.mjs';
 import {maxDuration,POST} from '../app/api/helper/route.js';
 const ok={relevant:true,grounded:true,noAdvice:true,noUnverifiedAccountClaims:true,missingInfoHandled:true};
 const sel={action:'answer',question:'',ruleIds:['mandate'],verdict:'not_checked'};
@@ -96,3 +96,6 @@ test('Gemini-only configuration preserves the legacy request and response format
  const m=mock({ok:false,status:429,json:async()=>({error:{status:'RESOURCE_EXHAUSTED'}})});
  assert.equal((await answer('Explain',{},[],m)).diagnostic,'selection:gemini_http_429_RESOURCE_EXHAUSTED');assert.equal(m.calls.length,1);
 }));
+
+test('skip-deadline questions get the fixed timing rule with sources and make NO AI call',()=>keyed(async()=>{for(const q of ['can i skip tomorrows payment','Can I skip tomorrow’s payment?','can I skip my SIP today','what is the last date to skip my sip','kal ka SIP skip kar sakta hoon?']){const m=mock(sel,draft,ok);const r=await answer(q,{},[],m);assert.equal(m.calls.length,0,q);assert.equal(r.mode,'rule',q);assert.deepEqual(r.ruleIds,['timing']);assert(r.sources.some(s=>s.id==='S1')&&r.sources.some(s=>s.id==='S3'));assert.match(r.message,/2 working days/);assert.match(r.message,/cannot confirm/);assert(!/\byes\b/i.test(r.message));}}));
+test('non-deadline skip questions still use the AI path',()=>keyed(async()=>{for(const q of ['What happens if I skip three SIP instalments in a row?','What does skip mean?','How long can I skip my SIP?']){assert.equal(skipTimingQuestion(q),false,q);}const m=mock({...sel,ruleIds:['skip']},{text:'Groww allows one instalment to be skipped at a time.',ruleIds:['skip']},ok);const r=await answer('Can I skip my SIP for a month?',{},[],m);assert.equal(m.calls.length,3);assert.equal(r.mode,'ai');}));
